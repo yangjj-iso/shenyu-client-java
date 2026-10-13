@@ -78,6 +78,16 @@
     </build>
     <profiles>
         <profile>
+            <id>runtime-compatibility</id>
+            <dependencies>
+                <dependency>
+                    <groupId>org.apache.shenyu</groupId>
+                    <artifactId>shenyu-registry-zookeeper</artifactId>
+                    <version>${shenyu.foundation.version}</version>
+                </dependency>
+            </dependencies>
+        </profile>
+        <profile>
             <id>example</id>
             <properties>
                 <docker.buildArg.APP_NAME>shenyu-examples-http</docker.buildArg.APP_NAME>

@@ -36,6 +36,7 @@ jobs:
       - name: Check migration ownership and test preservation
         run: |
           python3 script/test-migration.py
+          python3 script/test-runtime.py
           python3 script/check-migration.py
       - name: Prepare pinned main-owned foundations
         run: python3 script/prepare-foundations.py
@@ -71,22 +72,82 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  runtime_java17:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          cache-dependency-path: |
+            **/pom.xml
+            .github/migration-source.json
+      - name: Verify independent client registration and gateway lifecycle
+        run: python3 script/verify-runtime.py
+      - name: Preserve runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-runtime-java17
+          retention-days: 7
+          path: |
+            target/prepare-foundations.log
+            target/runtime-compatibility/*/*.json
+            target/runtime-compatibility/*/*.log
+
+  runtime_java21:
+    needs: [compat_java21, runtime_java17]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: |
+            **/pom.xml
+            .github/migration-source.json
+      - name: Verify Java 21 runtime compatibility using the main-repository push policy
+        run: python3 script/verify-runtime.py
+      - name: Preserve runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-runtime-java21
+          retention-days: 7
+          path: |
+            target/prepare-foundations.log
+            target/runtime-compatibility/*/*.json
+            target/runtime-compatibility/*/*.log
+
   requirement:
     if: always()
-    needs: [build, compat_java21, check-license-header]
+    needs: [build, compat_java21, check-license-header, runtime_java17, runtime_java21]
     runs-on: ubuntu-latest
     steps:
       - name: Check required jobs
         env:
           BUILD_RESULT: ${{ needs.build.result }}
           JAVA21_RESULT: ${{ needs.compat_java21.result }}
+          RUNTIME17_RESULT: ${{ needs.runtime_java17.result }}
+          RUNTIME21_RESULT: ${{ needs.runtime_java21.result }}
           LICENSE_RESULT: ${{ needs.check-license-header.result }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           [[ "$BUILD_RESULT" == 'success' ]] || exit 1
           [[ "$LICENSE_RESULT" == 'success' ]] || exit 1
+          [[ "$RUNTIME17_RESULT" == 'success' ]] || exit 1
           if [[ "$EVENT_NAME" == 'push' ]]; then
             [[ "$JAVA21_RESULT" == 'success' ]] || exit 1
+            [[ "$RUNTIME21_RESULT" == 'success' ]] || exit 1
           else
             [[ "$JAVA21_RESULT" == 'skipped' ]] || exit 1
+            [[ "$RUNTIME21_RESULT" == 'skipped' ]] || exit 1
           fi

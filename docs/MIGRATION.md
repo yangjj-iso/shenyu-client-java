@@ -21,6 +21,10 @@ required to review the migration, compile clients/examples, or run their tests.
   fixed SHA rather than tracking a moving branch or importing main client modules.
 - Replay protocol-JAR fixtures through the actual HTTP sender, preserving request
   field types, the v1 headers, unquoted success responses and retry/lifecycle behavior.
+- Run a client-owned source runtime job with the pinned main Admin/bootstrap,
+  independently built HTTP example and main-owned ZooKeeper provider. Check
+  registration, scheduled heartbeats, proxying and upstream removal on Java 17;
+  use main's push-only policy for Java 21.
 - Disable deployment and enforce a release profile gate until reviewed published
   foundation versions, ownership handoff and runtime compatibility are available.
 
@@ -60,6 +64,52 @@ The prior copied JDK8 models are not a second protocol definition.
    Only then update the preparation/deployment guards through a reviewed PR.
 
 ## Client-owned runtime scenarios
+
+The source-candidate runner does not require Docker or published artifacts:
+
+```bash
+python3 script/verify-runtime.py
+# Or reuse an existing clean checkout at the manifest's exact main SHA:
+python3 script/verify-runtime.py --main-source /absolute/path/to/main-checkout
+```
+
+Set `JAVA_HOME` to select the runtime/build JDK. `--maven-repo` uses the same
+optional Maven repository for both builds. The runner builds main foundations,
+Admin/bootstrap and the external example using their own wrappers. It resolves
+their classpaths separately and rejects business-client artifacts in main's
+runtime and server-test dependencies. The example's `runtime-compatibility`
+profile explicitly adds main's ZooKeeper provider. ZooKeeper server support
+libraries come from Admin's test dependencies, not the business application.
+
+Every run uses loopback ports, an in-memory H2 database, temporary registry data
+under `target/runtime-compatibility/<run-id>` and generated Admin/sync secrets.
+Services are stopped on success or failure. `report.json` records source commits,
+client build-input fingerprint, dirty paths, JDK, exact JAR paths/checksums,
+commands, ports and check outcomes. `registration-traffic.json` records the
+actual authenticated registration requests and Admin responses while excluding
+credentials/tokens/login bodies. Application logs suppress the shared utility's
+login response logging. CI uploads reports, traffic and process/build logs even
+on failure.
+
+The runner verifies the real example's metadata, selector, rules, numeric URI
+port, v1/client headers and unquoted `success`. It waits for two scheduled URI
+heartbeats, checks JSON-string `instanceInfo` and renewed Admin heartbeat times,
+then stops the application and requires an authenticated offline request, empty
+Admin upstreams, an empty namespace-scoped discovery frame consumed by bootstrap
+and the gateway's `-119` no-healthy-upstream response. Backend connection failure
+alone does not pass removal verification.
+
+For ZooKeeper, it starts two independently running examples under one service,
+checks the `/shenyu/register/instance/<appName>` listener and verifies upstream
+counts `1 -> 2 -> 1 -> 0` in Admin and gateway frames. The remaining instance must
+still proxy after the first exits. Discovery mode must not also send a local URI.
+The runner's evidence guards have negative tests in `script/test-runtime.py`.
+`--skip-build` is only for local replay of an earlier runner build; it refuses
+changed client Java, POM, resource or migration-manifest inputs.
+
+This is evidence for the pinned source candidate. It does not certify released
+pairs, registry instance-property updates, MCP/RPC runtime paths or replace the
+released-version matrix below.
 
 Start Admin and bootstrap from the selected released images and a moved Spring MVC
 example built from this candidate. Configure HTTP registration, matching Admin

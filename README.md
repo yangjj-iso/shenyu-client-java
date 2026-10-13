@@ -15,6 +15,7 @@ it is not a proposed official release number.
 
 ```bash
 python3 script/test-migration.py
+python3 script/test-runtime.py
 python3 script/check-migration.py
 python3 script/prepare-foundations.py
 ./mvnw clean verify -Dmaven.javadoc.skip=true -Djacoco.skip=true
@@ -82,6 +83,15 @@ instance heartbeat. It loads all eight JSON fixtures from the protocol JAR,
 checks serialized field values/types, token/protocol headers, and accepts old-style
 Admin `success` responses without new headers. Lifecycle, annotation, SPI, retry,
 shutdown and starter tests accompany the imported implementation.
+
+`python3 script/verify-runtime.py` also builds the pinned source Admin/bootstrap
+and independent HTTP example, then verifies actual registration, scheduled
+heartbeats, gateway proxy responses and shutdown. It covers local URI mode and
+two ZooKeeper instances with upstream transitions `1 -> 2 -> 1 -> 0`. Java 17 CI
+runs it for pull requests; Java 21 follows main's push-only policy. Every run
+saves reports, traffic and logs under `target/runtime-compatibility` and cleans
+up its processes. The [migration guide](docs/MIGRATION.md) explains replay options
+and the exact scope of this source-candidate evidence.
 
 These local contract tests do not certify a released Admin/client pair. See
 [the preparation and release checklist](docs/MIGRATION.md) for cross-repository

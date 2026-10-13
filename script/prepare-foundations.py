@@ -62,7 +62,7 @@ def prepare(root, main_source=None, maven_repo=None):
             raise ValueError("Missing foundation module: " + artifact)
         selected.append(modules[artifact])
     command = [str(source / "mvnw"), "-B", "-ntp", "-pl", ",".join(selected), "-am", "install",
-               "-Dmaven.test.skip=true", "-Dmaven.javadoc.skip=true", "-Djacoco.skip=true", "-DskipRemoteResources=true"]
+               "-DskipTests", "-Dmaven.test.skip=true", "-Dmaven.javadoc.skip=true", "-Djacoco.skip=true", "-DskipRemoteResources=true"]
     if maven_repo:
         command.append("-Dmaven.repo.local=" + str(maven_repo.resolve()))
     log = root / "target/prepare-foundations.log"
