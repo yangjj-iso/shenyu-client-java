@@ -18,64 +18,75 @@ name: ci
 on:
   pull_request:
   push:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        java: [ 8, 17, 21, 23, 25 ]
-        os: [ ubuntu-latest ]
-    runs-on: ${{ matrix.os }}
-    if: (github.repository == 'apache/shenyu-client-java')
+    runs-on: ubuntu-latest
     steps:
-      - name: Support longpaths
-        if: ${{ matrix.os == 'windows-latest'}}
-        run: git config --system core.longpaths true
       - uses: actions/checkout@v4
-        with:
-          submodules: true
-#      - uses: dorny/paths-filter@v2
-#        id: filter
-#        with:
-#          filters: '.github/filters.yml'
-#          list-files: json
       - uses: actions/setup-java@v4
-#        if: steps.filter.outputs.changed == 'true'
         with:
           distribution: temurin
-          java-version: ${{ matrix.java }}
+          java-version: '17'
           cache: maven
-      - name: Build with Maven
-#        if: steps.filter.outputs.changed == 'true'
-        run: ./mvnw -B clean test
-      - uses: codecov/codecov-action@v4
+          cache-dependency-path: |
+            **/pom.xml
+            .github/migration-source.json
+      - name: Check migration ownership and test preservation
+        run: |
+          python3 script/test-migration.py
+          python3 script/check-migration.py
+      - name: Prepare pinned main-owned foundations
+        run: python3 script/prepare-foundations.py
+      - name: Verify clients, starters and migrated examples
+        run: ./mvnw -B -ntp clean verify -Pexamples -Dmaven.javadoc.skip=true -Djacoco.skip=true -Ddocker.skip=true
+
+  compat_java21:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
-          token: 2760af6a-3405-4882-9e61-04c5176fecfa
-#        if: steps.filter.outputs.changed == 'true'
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: |
+            **/pom.xml
+            .github/migration-source.json
+      - name: Prepare pinned main-owned foundations
+        run: python3 script/prepare-foundations.py
+      - name: Verify Java 21 compatibility using the main-repository push policy
+        run: ./mvnw -B -ntp clean verify -Pexamples -Dmaven.javadoc.skip=true -Djacoco.skip=true -Ddocker.skip=true
 
   check-license-header:
-    name: check-license-header
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
       - name: Check License Header
         uses: apache/skywalking-eyes@9bd5feb86b5817aa6072b008f9866a2c3bbc8587
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   requirement:
-    name: build
     if: always()
-    needs:
-      - build
+    needs: [build, compat_java21, check-license-header]
     runs-on: ubuntu-latest
     steps:
-      - name: checking job status
+      - name: Check required jobs
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          JAVA21_RESULT: ${{ needs.compat_java21.result }}
+          LICENSE_RESULT: ${{ needs.check-license-header.result }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          [[ "${{ needs.build.result }}" == "success" ]] || exit -1
+          [[ "$BUILD_RESULT" == 'success' ]] || exit 1
+          [[ "$LICENSE_RESULT" == 'success' ]] || exit 1
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            [[ "$JAVA21_RESULT" == 'success' ]] || exit 1
+          else
+            [[ "$JAVA21_RESULT" == 'skipped' ]] || exit 1
+          fi
