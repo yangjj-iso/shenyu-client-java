@@ -109,6 +109,53 @@ class RuntimeTest(unittest.TestCase):
             source.write_text("class Client { int port; }")
             self.assertNotEqual(original, RUNTIME.client_build_fingerprint(root))
 
+    def test_colored_probe_result_is_valid_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "probe.log"
+            log.write_text('logger initialization\n\x1b[0;39mPROBE_RESULT={"weight":80}\n')
+            self.assertEqual({"weight": 80}, RUNTIME.probe_result(log))
+
+    def test_missing_or_duplicate_probe_results_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "probe.log"
+            for text in ['logger only\n', 'PROBE_RESULT={}\nPROBE_RESULT={}\n']:
+                log.write_text(text)
+                with self.assertRaises(AssertionError):
+                    RUNTIME.probe_result(log)
+
+    def mcp_events(self):
+        events = []
+        for name in ["findAllOrder", "findOrderById", "findByName"]:
+            arguments = {"id": "query"} if name == "findOrderById" else {}
+            template = {"url": "/mcp/order/findById", "method": "get", "argsPosition": arguments,
+                        "headers": [{"key": "aaa", "value": "bbb"}]}
+            config = {"name": name, "requestConfig": json.dumps({"requestTemplate": template, "argsPosition": arguments})}
+            events.append({"body": {"namespaceId": RUNTIME.NAMESPACE, "metaDataRegisterDTO": {
+                "namespaceId": RUNTIME.NAMESPACE, "contextPath": "/mcp", "host": "127.0.0.1", "port": 8150},
+                "mcpConfig": json.dumps(config)}})
+        return events
+
+    def test_mcp_nested_string_config_and_namespace_are_preserved(self):
+        self.assertEqual({"findAllOrder", "findOrderById", "findByName"}, set(RUNTIME.verify_mcp_wire(self.mcp_events(), 8150)))
+
+    def test_mcp_bad_namespace_or_placeholder_port_fails(self):
+        for field, value in [("namespaceId", "other"), ("port", -1)]:
+            events = self.mcp_events()
+            events[0]["body"]["metaDataRegisterDTO"][field] = value
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                RUNTIME.verify_mcp_wire(events, 8150)
+
+    def test_mcp_argument_position_must_match_the_backend_query(self):
+        events = self.mcp_events()
+        config = json.loads(events[1]["body"]["mcpConfig"])
+        request = json.loads(config["requestConfig"])
+        request["argsPosition"]["id"] = "path"
+        request["requestTemplate"]["argsPosition"]["id"] = "path"
+        config["requestConfig"] = json.dumps(request)
+        events[1]["body"]["mcpConfig"] = json.dumps(config)
+        with self.assertRaises(AssertionError):
+            RUNTIME.verify_mcp_wire(events, 8150)
+
 
 if __name__ == "__main__":
     unittest.main()

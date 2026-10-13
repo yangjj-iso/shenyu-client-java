@@ -32,9 +32,11 @@ shenyu:
       props:
         contextPath: /mcp
         appName: mcp
+        host: 127.0.0.1
+        port: ${server.port}
     http:
       props:
         contextPath: /mcp
         appName: mcp
         host: 127.0.0.1
-        port: 8150
+        port: ${server.port}

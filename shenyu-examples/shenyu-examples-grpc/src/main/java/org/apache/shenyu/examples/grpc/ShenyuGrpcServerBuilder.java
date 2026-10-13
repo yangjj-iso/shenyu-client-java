@@ -18,9 +18,12 @@
 package org.apache.shenyu.examples.grpc;
 
 import io.grpc.ServerBuilder;
+import io.grpc.netty.NettyServerBuilder;
 import org.apache.shenyu.client.grpc.server.GrpcServerBuilder;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+
+import java.net.InetSocketAddress;
 
 /**
  * Grpc ServerBuilder.
@@ -31,8 +34,11 @@ public class ShenyuGrpcServerBuilder implements GrpcServerBuilder {
     @Value("${shenyu.client.grpc.props.port}")
     private Integer port;
 
+    @Value("${server.address:0.0.0.0}")
+    private String address;
+
     @Override
     public ServerBuilder<?> buildServerBuilder() {
-        return ServerBuilder.forPort(port);
+        return NettyServerBuilder.forAddress(new InetSocketAddress(address, port));
     }
 }

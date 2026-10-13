@@ -74,7 +74,7 @@ public class OrderController {
     public OrderDTO findById(@ShenyuMcpToolParam(
             parameter = @Parameter(
                     name = "id",
-                    in = ParameterIn.PATH,
+                    in = ParameterIn.QUERY,
                     description = "the id of order",
                     required = true,
                     schema = @Schema(

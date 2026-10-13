@@ -28,6 +28,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -42,6 +43,9 @@ import uuid
 sys.dont_write_bytecode = True
 NAMESPACE = "649330b6-c2d7-4edc-be8e-8a54df9eb385"
 EXAMPLE = "shenyu-examples/shenyu-examples-http"
+GRPC_EXAMPLE = "shenyu-examples/shenyu-examples-grpc"
+MCP_EXAMPLE = "shenyu-examples/shenyu-examples-mcp"
+EXAMPLES = ",".join((EXAMPLE, GRPC_EXAMPLE, MCP_EXAMPLE))
 VERSION_HEADER = "X-Shenyu-Register-Protocol-Version"
 CLIENT_HEADER = "X-Shenyu-Client-Version"
 OPENER = build_opener(ProxyHandler({}))
@@ -68,6 +72,13 @@ def require(condition, evidence):
         raise AssertionError(evidence)
 
 
+def probe_result(log):
+    lines = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in log.read_text().splitlines()]
+    results = [line.removeprefix("PROBE_RESULT=") for line in lines if line.startswith("PROBE_RESULT=")]
+    require(len(results) == 1, "Probe did not produce one evidence result: " + str(log))
+    return json.loads(results[0])
+
+
 def client_build_fingerprint(root):
     paths = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=root).split(b"\0")
     digest = hashlib.sha256()
@@ -80,7 +91,7 @@ def client_build_fingerprint(root):
     return digest.hexdigest()
 
 
-def gateway_snapshot(log, context):
+def gateway_upstream_data(log, context):
     latest = None
     for line in log.read_text().splitlines():
         marker = line.find('{"groupType":"DISCOVER_UPSTREAM"')
@@ -89,8 +100,13 @@ def gateway_snapshot(log, context):
         frame, _ = json.JSONDecoder().raw_decode(line[marker:])
         for item in frame["data"]:
             if item.get("selectorName") == context and item.get("namespaceId") == NAMESPACE:
-                latest = sorted(upstream["url"] for upstream in item["upstreamDataList"])
+                latest = item["upstreamDataList"]
     return latest
+
+
+def gateway_snapshot(log, context):
+    data = gateway_upstream_data(log, context)
+    return None if data is None else sorted(upstream["url"] for upstream in data)
 
 
 def gateway_empty(url):
@@ -201,6 +217,28 @@ def verify_wire(events, client_version):
                 require(isinstance(json.loads(dto["instanceInfo"]), dict), dto)
 
 
+def verify_mcp_wire(events, port):
+    configs = {}
+    for event in events:
+        dto = event["body"]
+        metadata = dto["metaDataRegisterDTO"]
+        require(dto["namespaceId"] == metadata["namespaceId"] == NAMESPACE, dto)
+        require(metadata["contextPath"] == "/mcp" and metadata["host"] == "127.0.0.1" and metadata["port"] == port, metadata)
+        require(isinstance(dto["mcpConfig"], str), dto)
+        config = json.loads(dto["mcpConfig"])
+        require(isinstance(config["requestConfig"], str), config)
+        request_config = json.loads(config["requestConfig"])
+        require(request_config["argsPosition"] == request_config["requestTemplate"]["argsPosition"], request_config)
+        configs[config["name"]] = config
+    require(set(configs) == {"findAllOrder", "findOrderById", "findByName"}, configs)
+    order = json.loads(configs["findOrderById"]["requestConfig"])
+    require(order["argsPosition"] == {"id": "query"}, order)
+    require(order["requestTemplate"]["url"] == "/mcp/order/findById", order)
+    require(order["requestTemplate"]["method"].upper() == "GET", order)
+    require(order["requestTemplate"]["headers"] == [{"key": "aaa", "value": "bbb"}], order)
+    return configs
+
+
 class Runtime:
     def __init__(self, root, main, output, maven_repo):
         self.root, self.main, self.output = root, main, output
@@ -222,12 +260,34 @@ class Runtime:
         deps = (module / "target/runtime-classpath.txt").read_text().strip()
         return str(module / "target" / filename) + os.pathsep + deps
 
+    def compile_probe(self, classpath):
+        home = os.environ.get("JAVA_HOME")
+        javac = str(Path(home) / "bin/javac") if home else "javac"
+        classes = self.output / "probe-classes"
+        classes.mkdir()
+        command = [javac, "-source", "17", "-target", "17", "-cp", classpath, "-d", str(classes), str(self.root / "script/runtime/RuntimeProbe.java")]
+        self.commands.append(command)
+        with (self.output / "compile-probe.log").open("w") as log:
+            subprocess.run(command, cwd=self.root, stdout=log, stderr=subprocess.STDOUT, check=True)
+        return str(classes) + os.pathsep + classpath
+
+    def probe(self, name, classpath, arguments):
+        process = self.start(name, classpath, "RuntimeProbe", arguments)
+        try:
+            process.wait(timeout=55)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(name + " timed out; inspect its runtime log")
+        require(process.returncode == 0, name + " failed; inspect its runtime log")
+        self.processes = [(label, item) for label, item in self.processes if item is not process]
+        return probe_result(self.output / (name + ".log"))
     def start(self, name, classpath, main_class, arguments):
         log = (self.output / (name + ".log")).open("w")
         self.logs.append(log)
         if main_class.startswith("org.apache.shenyu."):
             arguments = [*arguments, "--logging.level.org.apache.shenyu.register.common.utils.RegisterUtils=WARN"]
-        command = [java_binary(), "-Xmx512m", "-XX:ActiveProcessorCount=4", "-Dio.netty.eventLoopThreads=4",
+        # Main's timer rejects queued tasks below 256 MiB of free committed heap.
+        # A small implicit initial heap can reject registration recovery despite a larger maximum.
+        command = [java_binary(), "-Xms768m", "-Xmx1024m", "-XX:ActiveProcessorCount=4", "-Dio.netty.eventLoopThreads=4",
                    "-cp", classpath, main_class, *arguments]
         self.commands.append(command)
         process = subprocess.Popen(command, cwd=self.output, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -290,9 +350,9 @@ def run(root, args):
             raise ValueError("Client build inputs changed or no build receipt exists; rerun without --skip-build")
         if not args.skip_build:
             runtime.maven(main, ["-pl", "shenyu-admin,shenyu-bootstrap", "-am", "install", *common], "build-main")
-            runtime.maven(root, [profiles, "-pl", EXAMPLE, "-am", "install", *common, "-Ddocker.skip=true"], "build-client")
+            runtime.maven(root, [profiles, "-pl", EXAMPLES, "-am", "install", *common, "-Ddocker.skip=true"], "build-client")
             for source, selected, profile, name in [(main, "shenyu-admin,shenyu-bootstrap", [], "classpath-main"),
-                                                     (root, EXAMPLE, [profiles], "classpath-client")]:
+                                                     (root, EXAMPLES, [profiles], "classpath-client")]:
                 runtime.maven(source, [*profile, "-pl", selected, "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:build-classpath",
                                       "-DincludeScope=runtime", "-Dmdep.outputFile=target/runtime-classpath.txt"], name)
             runtime.maven(main, ["-pl", "shenyu-admin", "org.apache.maven.plugins:maven-dependency-plugin:3.6.1:build-classpath",
@@ -301,22 +361,25 @@ def run(root, args):
         admin_cp = runtime.classpath(main / "shenyu-admin", "shenyu-admin.jar")
         gateway_cp = runtime.classpath(main / "shenyu-bootstrap", "shenyu-bootstrap.jar")
         client_cp = runtime.classpath(root / EXAMPLE, "shenyu-examples-http.jar")
+        grpc_cp = runtime.classpath(root / GRPC_EXAMPLE, "shenyu-examples-grpc.jar")
+        mcp_cp = runtime.classpath(root / MCP_EXAMPLE, "shenyu-examples-mcp-" + manifest["client_preparation_version"] + ".jar")
         # ZooKeeper server needs metrics/snappy dependencies that its client POM marks provided.
         # Reuse Admin's pinned test dependencies, never add server libraries to business clients.
         server_cp = (main / "shenyu-admin/target/runtime-test-classpath.txt").read_text().strip()
         main_owned_classpath(admin_cp)
         main_owned_classpath(gateway_cp)
         main_owned_classpath(server_cp)
+        probe_cp = runtime.compile_probe(gateway_cp + os.pathsep + server_cp)
         report["checks"]["main_runtime_ownership"] = True
         report["artifacts"] = [{"path": str(Path(entry)), "sha256": hashlib.sha256(Path(entry).read_bytes()).hexdigest()}
-                               for entry in sorted(set(os.pathsep.join((admin_cp, gateway_cp, client_cp, server_cp)).split(os.pathsep)))]
-        for _ in range(7):
+                               for entry in sorted(set(os.pathsep.join((admin_cp, gateway_cp, client_cp, grpc_cp, mcp_cp, server_cp)).split(os.pathsep)))]
+        for _ in range(10):
             bound = socket.socket()
             bound.bind(("127.0.0.1", 0))
             sockets.append(bound)
-        admin_port, gateway_port, proxy_port, local_port, zk_port, discovery_port, second_port = [item.getsockname()[1] for item in sockets]
-        report["ports"] = dict(zip(["admin", "gateway", "registration_proxy", "local_client", "zookeeper", "discovery_client", "second_discovery_client"],
-                                   [admin_port, gateway_port, proxy_port, local_port, zk_port, discovery_port, second_port]))
+        admin_port, gateway_port, proxy_port, local_port, zk_port, discovery_port, second_port, grpc_http_port, grpc_port, mcp_port = [item.getsockname()[1] for item in sockets]
+        report["ports"] = dict(zip(["admin", "gateway", "registration_proxy", "local_client", "zookeeper", "discovery_client", "second_discovery_client", "grpc_http", "grpc", "mcp"],
+                                   [admin_port, gateway_port, proxy_port, local_port, zk_port, discovery_port, second_port, grpc_http_port, grpc_port, mcp_port]))
         admin_url, gateway_url = f"http://127.0.0.1:{admin_port}", f"http://127.0.0.1:{gateway_port}"
         token_sync = uuid.uuid4().hex
         sockets[0].close()
@@ -338,6 +401,16 @@ def run(root, args):
             result = json.loads(body)
             require(result["code"] == 200, result)
             return result["data"]
+
+        def admin_mutation(path, body, method="POST"):
+            status, text, _ = request(admin_url + path, body, auth, method)
+            require(status == 200 and json.loads(text)["code"] == 200, text)
+
+        def enable_plugin(name):
+            plugins = page("/namespace-plugin", name=name)
+            plugins = [plugin for plugin in plugins if plugin["name"] == name]
+            require(len(plugins) == 1, plugins)
+            admin_mutation("/namespace-plugin/enabled", {"ids": [plugins[0]["id"]], "enabled": True})
 
         def page(path, **query):
             return admin_data(path, currentPage=1, pageSize=100, namespaceId=NAMESPACE, **query)["dataList"]
@@ -408,6 +481,12 @@ def run(root, args):
         sockets[6].close()
         second, _, _ = client("compat-zookeeper-b", "/compat-zookeeper", second_port, discovery=True, app_name="compat-zookeeper",
                               expected_upstreams=[f"127.0.0.1:{discovery_port}", f"127.0.0.1:{second_port}"])
+        update = runtime.probe("registry-weight-update", probe_cp, ["registry-update", f"127.0.0.1:{zk_port}", "compat-zookeeper", str(second_port), "80"])
+        wait_for("Admin registry weight update", lambda: any(row["url"] == f"127.0.0.1:{second_port}" and row["weight"] == 80
+                 for row in (upstreams("/compat-zookeeper") or [])), runtime.processes)
+        wait_for("gateway registry weight update", lambda: any(row["url"] == f"127.0.0.1:{second_port}" and row["weight"] == 80
+                 for row in (gateway_upstream_data(output / "gateway.log", "/compat-zookeeper") or [])), runtime.processes)
+        report["checks"]["zookeeper_instance_weight_update"] = update
         configs = proxy.matching("/shenyu-client/register-discoveryConfig")
         require(any(item["body"]["listenerNode"] == "/shenyu/register/instance/compat-zookeeper" for item in configs), configs)
         require(not proxy.matching("/shenyu-client/register-uri", "/compat-zookeeper"), "Discovery mode published a local URI")
@@ -422,9 +501,75 @@ def run(root, args):
         wait_for("discovery gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/compat-zookeeper") == [], runtime.processes[:2], timeout=30)
         wait_for("discovery gateway convergence", lambda: gateway_empty(gateway_url + "/compat-zookeeper" + zk_route), runtime.processes[:2], timeout=30)
         report["checks"]["zookeeper_instance_add_remove"] = {"upstream_counts": [1, 2, 1, 0]}
+
+        enable_plugin("grpc")
+        sockets[7].close()
+        sockets[8].close()
+        grpc = runtime.start("grpc-client", grpc_cp, "org.apache.shenyu.examples.grpc.ShenyuTestGrpcApplication",
+                             [f"--server.port={grpc_http_port}", "--server.address=127.0.0.1",
+                              f"--shenyu.register.serverLists=http://127.0.0.1:{proxy_port}",
+                              f"--shenyu.client.grpc.props.ipAndPort=127.0.0.1:{grpc_port}",
+                              "--shenyu.client.grpc.props.host=127.0.0.1",
+                              f"--shenyu.client.grpc.props.port={grpc_port}", "--logging.level.org.apache.shenyu=INFO"])
+        wait_for("gRPC backend readiness", lambda: listening(grpc_port), runtime.processes)
+        wait_for("gRPC metadata", lambda: any(row["path"] == "/grpc/echo" and row["rpcType"] == "grpc" for row in page("/meta-data/queryList")), runtime.processes)
+        def grpc_response():
+            status, body, _ = request(gateway_url + "/grpc/echo", {"data": [{"message": "migration-7602"}]})
+            value = json.loads(body)
+            return value if status == 200 and isinstance(value, list) and value and value[0].get("message") == "ReceivedHELLO" else None
+        response = wait_for("real gRPC gateway proxy", grpc_response, runtime.processes)
+        report["checks"]["grpc_registered_and_proxied"] = response
+        rpc_cases = {
+            "helloService/hello": ({"data": [{"data": "migration-7602"}]}, [{"data": "hello: migration-7602"}]),
+            "unaryFun": ({"data": [{"text": "migration-7602"}]}, [{"text": "unaryFun response: hello gRPC"}]),
+            "serverStreamingFun": ({"data": [{"text": "migration-7602"}]}, [{"text": f"serverStreamingFun response: hello {index}"} for index in range(10)]),
+            "clientStreamingFun": ({"data": [{"text": "first"}, {"text": "second"}]}, [{"text": "clientStreamingFun onCompleted"}]),
+            "bidiStreamingFun": ({"data": [{"text": "first"}, {"text": "second"}]}, [{"text": "bidiStreamingFun response: hello"},
+                                                                                      {"text": "bidiStreamingFun response: hello"}, {"text": "bidiStreamingFun onCompleted"}]),
+        }
+        rpc_results = {}
+        for method, (payload, expected_response) in rpc_cases.items():
+            def rpc_response():
+                status, body, _ = request(gateway_url + "/grpc/" + method, payload)
+                value = json.loads(body)
+                return value if status == 200 and value == expected_response else None
+            rpc_results[method] = wait_for("gRPC " + method, rpc_response, runtime.processes)
+        report["checks"]["grpc_unary_and_streaming"] = rpc_results
+        runtime.stop(grpc)
+        runtime.processes = [(name, process) for name, process in runtime.processes if process is not grpc]
+        wait_for("gRPC offline request", lambda: proxy.matching("/shenyu-client/offline", "/grpc", "OFFLINE"), runtime.processes)
+        wait_for("gRPC gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/grpc") == [], runtime.processes)
+        report["checks"]["grpc_shutdown_removed_upstream"] = True
+
+        enable_plugin("mcpServer")
+        sockets[9].close()
+        mcp = runtime.start("mcp-client", mcp_cp, "org.apache.shenyu.examples.ShenyuTestMcpApplication",
+                            [f"--server.port={mcp_port}", "--server.address=127.0.0.1",
+                             f"--shenyu.register.serverLists=http://127.0.0.1:{proxy_port}"])
+        wait_for("MCP example readiness", lambda: request(f"http://127.0.0.1:{mcp_port}/order/findAll")[0] == 200, runtime.processes)
+        wait_for("MCP registration", lambda: len(proxy.matching("/shenyu-client/register-mcp")) == 3, runtime.processes)
+        wait_for("MCP backend upstream", lambda: gateway_snapshot(output / "gateway.log", "/mcp") == [f"127.0.0.1:{mcp_port}"], runtime.processes)
+        wait_for("MCP rules", lambda: any(row["name"] == "/mcp" for row in page("/selector", pluginId="61")), runtime.processes)
+        configs = verify_mcp_wire(proxy.matching("/shenyu-client/register-mcp"), mcp_port)
+        selectors = [row for row in page("/selector", pluginId="61") if row["name"] == "/mcp"]
+        def mcp_rules():
+            rows = page("/rule", selectorId=selectors[0]["id"])
+            return rows if {row["name"] for row in rows} == set(configs) else None
+        rules = wait_for("MCP tool rules in Admin", mcp_rules, runtime.processes)
+        stored_configs = {row["name"]: json.loads(row["handle"]) for row in rules}
+        require(stored_configs == configs, stored_configs)
+        report["checks"]["mcp_nested_registration_preserved"] = True
+        report["checks"]["mcp_registered_and_called"] = runtime.probe("mcp-tool-calls", probe_cp, ["mcp", gateway_url, "/mcp/streamablehttp"])
+        runtime.stop(mcp)
+        runtime.processes = [(name, process) for name, process in runtime.processes if process is not mcp]
+        wait_for("MCP HTTP offline request", lambda: proxy.matching("/shenyu-client/offline", "/mcp", "OFFLINE"), runtime.processes)
+        wait_for("MCP backend gateway empty snapshot", lambda: gateway_snapshot(output / "gateway.log", "/mcp") == [], runtime.processes)
+        report["checks"]["mcp_backend_shutdown_removed_upstream"] = True
         verify_wire(proxy.events, manifest["client_preparation_version"])
         report["checks"]["authenticated_v1_wire_contract"] = True
         report["result"] = "passed"
+    except subprocess.CalledProcessError as error:
+        report["error"] = f"{Path(error.cmd[0]).name} failed with exit code {error.returncode}; inspect the build/compile logs"
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"
     finally:

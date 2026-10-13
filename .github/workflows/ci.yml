@@ -86,7 +86,7 @@ jobs:
           cache-dependency-path: |
             **/pom.xml
             .github/migration-source.json
-      - name: Verify independent client registration and gateway lifecycle
+      - name: Verify registration, registry updates, gRPC and MCP through the gateway
         run: python3 script/verify-runtime.py
       - name: Preserve runtime evidence
         if: always()

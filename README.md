@@ -87,7 +87,10 @@ shutdown and starter tests accompany the imported implementation.
 `python3 script/verify-runtime.py` also builds the pinned source Admin/bootstrap
 and independent HTTP example, then verifies actual registration, scheduled
 heartbeats, gateway proxy responses and shutdown. It covers local URI mode and
-two ZooKeeper instances with upstream transitions `1 -> 2 -> 1 -> 0`. Java 17 CI
+two ZooKeeper instances with upstream transitions `1 -> 2 -> 1 -> 0`. It also
+covers registry weight updates, gRPC unary/streaming calls and MCP Streamable HTTP
+initialization, tool listing and real parameterized/parameterless tool calls. It
+also checks nested MCP namespace/request configuration preservation. Java 17 CI
 runs it for pull requests; Java 21 follows main's push-only policy. Every run
 saves reports, traffic and logs under `target/runtime-compatibility` and cleans
 up its processes. The [migration guide](docs/MIGRATION.md) explains replay options

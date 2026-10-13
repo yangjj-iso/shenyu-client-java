@@ -25,6 +25,8 @@ required to review the migration, compile clients/examples, or run their tests.
   independently built HTTP example and main-owned ZooKeeper provider. Check
   registration, scheduled heartbeats, proxying and upstream removal on Java 17;
   use main's push-only policy for Java 21.
+- Include registry weight updates, migrated gRPC unary/streaming calls and MCP
+  nested registration plus actual Streamable HTTP tool calls in the runtime job.
 - Disable deployment and enforce a release profile gate until reviewed published
   foundation versions, ownership handoff and runtime compatibility are available.
 
@@ -77,7 +79,8 @@ Set `JAVA_HOME` to select the runtime/build JDK. `--maven-repo` uses the same
 optional Maven repository for both builds. The runner builds main foundations,
 Admin/bootstrap and the external example using their own wrappers. It resolves
 their classpaths separately and rejects business-client artifacts in main's
-runtime and server-test dependencies. The example's `runtime-compatibility`
+runtime and server-test dependencies. It also builds the moved gRPC and MCP
+examples. The HTTP example's `runtime-compatibility`
 profile explicitly adds main's ZooKeeper provider. ZooKeeper server support
 libraries come from Admin's test dependencies, not the business application.
 
@@ -91,6 +94,11 @@ credentials/tokens/login bodies. Application logs suppress the shared utility's
 login response logging. CI uploads reports, traffic and process/build logs even
 on failure.
 
+Test JVMs use `-Xms768m -Xmx1024m`: the pinned main timer queue requires more than
+256 MiB of free committed heap, so a small implicit initial heap can discard a
+registration-recovery task even with unused room below the maximum heap. Earlier
+undersized-heap failures remain in their run reports; they are not passing evidence.
+
 The runner verifies the real example's metadata, selector, rules, numeric URI
 port, v1/client headers and unquoted `success`. It waits for two scheduled URI
 heartbeats, checks JSON-string `instanceInfo` and renewed Admin heartbeat times,
@@ -102,14 +110,38 @@ alone does not pass removal verification.
 For ZooKeeper, it starts two independently running examples under one service,
 checks the `/shenyu/register/instance/<appName>` listener and verifies upstream
 counts `1 -> 2 -> 1 -> 0` in Admin and gateway frames. The remaining instance must
-still proxy after the first exits. Discovery mode must not also send a local URI.
+still proxy after the first exits. It updates one registered instance's weight
+from 50 to 80 through main's registry API and requires the update in both Admin
+and bootstrap's received discovery data. Discovery mode must not also send a local URI.
 The runner's evidence guards have negative tests in `script/test-runtime.py`.
 `--skip-build` is only for local replay of an earlier runner build; it refuses
 changed client Java, POM, resource or migration-manifest inputs.
 
+The runner enables gRPC and MCP only in its fresh in-memory Admin. gRPC verifies
+method and class annotation registration, a real echo response, unary invocation,
+ten server-stream responses, client-stream completion and bidirectional messages
+through the gateway. The gRPC example honors `server.address` so its RPC listener
+can bind to loopback along with its HTTP listener.
+
+For MCP, it verifies three annotated tools and exact preservation of their nested
+metadata, namespaces and JSON-string request configuration in Admin's rule handles.
+The example's MCP and HTTP metadata ports follow `server.port`. The `id` tool
+parameter is declared as a query parameter to match the controller's `@RequestParam`;
+declaring it as a path parameter made real tool calls return HTTP 400.
+
+A small client-owned Java probe uses the already resolved main registry/MCP SDK
+classpath, with no new business dependency in main. The MCP probe explicitly uses
+protocol `2025-03-26`, supported by this pinned server and SDK; their default latest
+protocol versions differ. It initializes Streamable HTTP, lists tools and calls
+both a parameterless tool and `findOrderById(id=7602)` against the real backend.
+The HTTP upstream must be present in bootstrap before invoking tools. Both gRPC
+and the MCP backend's HTTP registration must send offline on shutdown and reach
+an empty gateway discovery snapshot. The runner preserves probe output and checks
+for one JSON evidence record, including when logs contain ANSI color prefixes.
+
 This is evidence for the pinned source candidate. It does not certify released
-pairs, registry instance-property updates, MCP/RPC runtime paths or replace the
-released-version matrix below.
+pairs, other registry providers, other MCP transports/protocol versions or other
+RPC starters, and does not replace the released-version matrix below.
 
 Start Admin and bootstrap from the selected released images and a moved Spring MVC
 example built from this candidate. Configure HTTP registration, matching Admin
